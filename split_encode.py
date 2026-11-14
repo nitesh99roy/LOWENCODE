@@ -332,7 +332,7 @@ def make_extras(src, plan):
         if info["has_attachments"]:
             args += ["-map", "0:t?"]
         args += ["-map_metadata", "0", "-map_chapters", "0",
-                 "-c:a", "aac", "-b:a", fmt["audio_bitrate"]]
+                 "-c:a", fmt.get("audio_codec", "aac"), "-b:a", fmt["audio_bitrate"]]
         if fmt["audio_channels"]:
             for i, a in enumerate(audio):
                 if a["channels"] > fmt["audio_channels"]:

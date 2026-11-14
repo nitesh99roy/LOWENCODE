@@ -5,10 +5,11 @@ LowEncoder.py - CPU (libx265 / HEVC) small-size encoder. One quality, no waterma
 CPU version of MOVIES.py (HEVC QSV) with the same encode structure:
   * HEVC, profile main, GOP 240 closed (IDR), 7 B-frames, 4 reference frames
   * fixed output height (480 / 720 / 1080), width follows the aspect ratio
-  * every audio track -> AAC 64k stereo, subtitles copied (first one default)
+  * every audio track -> Opus 48k stereo, subtitles copied (first one default)
   * smart black-bar crop
 Rate control: CRF 27 (quality-based) capped at the old QSV max bitrate for
 each quality, so busy scenes can never blow up the file size.
+Quality: 10-bit (Main10), preset slower, 480p/720p tuned with ctu=32 + qg-size=16.
 
 Local use: put videos in Encode_Input/, run `py LowEncoder.py`, pick a quality.
 GitHub use: split_encode.py imports this file for its settings (ENCODER_MODULE=LowEncoder).
@@ -31,8 +32,8 @@ INPUT_FOLDER = "Encode_Input"
 OUTPUT_FOLDER = "Encode_Output"
 
 CRF = 27                  # higher = smaller file. 27 = small but clean for HEVC
-X265_PRESET = "slow"      # medium / slow / slower / veryslow (MOVIES.py used veryslow on QSV)
-TEN_BIT = False           # True = HEVC Main10: ~3-5% smaller + no banding, needs a 10-bit capable player
+X265_PRESET = "slower"    # medium / slow / slower / veryslow (MOVIES.py used veryslow on QSV)
+TEN_BIT = True            # HEVC Main10: more quality per MB + no banding (needs a 10-bit capable player)
 
 # x265 settings matching MOVIES.py + extras for better quality per MB
 X265_PARAMS = {
@@ -50,6 +51,9 @@ X265_PARAMS = {
     "rdoq-level": 2,       # rate-distortion optimised quantisation (MOVIES.py: rdo)
     "log-level": "error",
 }
+# Extra tuning for low resolutions (480p / 720p): smaller coding blocks and finer
+# adaptive quantisation keep more detail. 1080p keeps x265's default 64x64 blocks.
+LOWRES_PARAMS = {"ctu": 32, "qg-size": 16}
 
 # One entry per quality. maxrate/bufsize = MOVIES.py's max bitrate window (kbps).
 QUALITIES = {
@@ -57,11 +61,12 @@ QUALITIES = {
     "720p": {"height": 720, "maxrate": "900k", "bufsize": "1800k"},
     "1080p": {"height": 1080, "maxrate": "1750k", "bufsize": "3500k"},
 }
-AUDIO_BITRATE = "64k"     # per audio track (MOVIES.py: -b:a 64k -ac 2)
-AUDIO_CHANNELS = 2
+AUDIO_CODEC = "libopus"   # Opus: better than AAC at lower bitrate ("aac" for old TVs)
+AUDIO_BITRATE = "48k"     # per audio track (Opus 48k sounds better than AAC 64k)
+AUDIO_CHANNELS = 2        # stereo
 
 # Shared-interface values used by split_encode.py
-FORMATS = {tag: {"box": (q["height"] * 16 // 9, q["height"]),
+FORMATS = {tag: {"box": (q["height"] * 16 // 9, q["height"]), "audio_codec": AUDIO_CODEC,
                  "audio_bitrate": AUDIO_BITRATE, "audio_channels": AUDIO_CHANNELS}
            for tag, q in QUALITIES.items()}
 SKIP_UPSCALE = True
@@ -86,8 +91,9 @@ def apply_env():
 
 
 def describe():
+    audio = "Opus" if AUDIO_CODEC == "libopus" else AUDIO_CODEC.upper()
     return (f"x265 {X265_PRESET} | CRF {CRF} | {'10-bit Main10' if TEN_BIT else '8-bit Main'} | "
-            f"audio AAC {AUDIO_BITRATE} stereo")
+            f"audio {audio} {AUDIO_BITRATE} stereo")
 
 
 def video_args(tag):
@@ -95,7 +101,10 @@ def video_args(tag):
     args = ["-c:v", "libx265", "-preset", X265_PRESET, "-crf", str(CRF),
             "-profile:v", "main10" if TEN_BIT else "main",
             "-maxrate", q["maxrate"], "-bufsize", q["bufsize"]]
-    args += ["-x265-params", ":".join(f"{k}={v}" for k, v in X265_PARAMS.items())]
+    params = dict(X265_PARAMS)
+    if q["height"] <= 720:
+        params.update(LOWRES_PARAMS)
+    args += ["-x265-params", ":".join(f"{k}={v}" for k, v in params.items())]
     return args
 
 
@@ -376,7 +385,7 @@ def encode_file(video, input_dir, output_dir, tag, enable_crop):
     if info["has_attachments"]:
         cmd += ["-map", "0:t?", "-c:t", "copy"]
     cmd += ["-map_metadata", "0", "-map_chapters", "0"] + video_args(tag)
-    cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ac", str(AUDIO_CHANNELS)]
+    cmd += ["-c:a", AUDIO_CODEC, "-b:a", AUDIO_BITRATE, "-ac", str(AUDIO_CHANNELS)]
     for i, s in enumerate(info["subs"]):
         cmd += [f"-c:s:{i}", "srt" if s["codec"] in SUBS_TO_SRT else "copy"]
     if info["subs"] and DEFAULT_FIRST_SUBTITLE:

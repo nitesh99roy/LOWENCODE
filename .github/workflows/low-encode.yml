@@ -30,15 +30,15 @@ on:
         description: "x265 preset (slower = smaller file at same quality)"
         type: choice
         options: [medium, slow, slower, veryslow]
-        default: slow
+        default: slower
       ten_bit:
-        description: "10-bit HEVC (Main10): a bit smaller + no banding, needs a 10-bit capable player"
+        description: "10-bit HEVC (Main10): better quality per MB + no banding, needs a 10-bit capable player"
         type: boolean
-        default: false
+        default: true
       chunks:
         description: "Number of pieces encoded at the same time (2-20)"
         required: true
-        default: "16"
+        default: "20"
       crop:
         description: "Remove black bars"
         type: boolean
