@@ -415,6 +415,28 @@ def media_duration(path):
         return 0.0
 
 
+def interleave_lead(path):
+    """How many seconds audio is written ahead of video, worst case, in file order.
+    A few tenths is normal; many seconds makes players drop the audio."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type",
+                        "-of", "csv=p=0", path], capture_output=True, text=True)
+    kinds = dict(line.split(",")[:2] for line in r.stdout.split() if "," in line)
+    p = subprocess.Popen(["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time",
+                          "-of", "csv=p=0", path], stdout=subprocess.PIPE, text=True)
+    max_audio, worst = 0.0, 0.0
+    for line in p.stdout:
+        parts = line.strip().split(",")
+        if len(parts) < 2 or parts[1] in ("", "N/A"):
+            continue
+        kind, t = kinds.get(parts[0]), float(parts[1])
+        if kind == "audio":
+            max_audio = max(max_audio, t)
+        elif kind == "video":
+            worst = max(worst, max_audio - t)
+    p.wait()
+    return worst
+
+
 def cmd_merge():
     d = os.path.join(WORK, "merge")
     store_download(["plan.json", "piece_*"], d)
@@ -461,6 +483,12 @@ def cmd_merge():
             print(f"::warning::{os.path.basename(out)} is {got:.2f}s but the source is "
                   f"{plan['duration']:.2f}s - please check it")
         print(f"✅ {os.path.basename(out)}: {mb(out)}, {CE.format_time(got)}")
+        lead = interleave_lead(out)
+        if lead > 2:
+            print(f"::warning::{os.path.basename(out)}: audio is written up to {lead:.1f}s ahead of "
+                  f"video - players may drop audio")
+        else:
+            print(f"🔊 Audio/video order OK (audio at most {lead:.2f}s ahead of video)")
         for p in pieces:
             os.remove(p)
 
