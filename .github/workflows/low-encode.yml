@@ -30,7 +30,7 @@ on:
         description: "x265 preset (slower = smaller file at same quality)"
         type: choice
         options: [medium, slow, slower, veryslow]
-        default: slower
+        default: slow
       ten_bit:
         description: "10-bit HEVC (Main10): better quality per MB + no banding, needs a 10-bit capable player"
         type: boolean

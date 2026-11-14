@@ -9,7 +9,7 @@ CPU version of MOVIES.py (HEVC QSV) with the same encode structure:
   * smart black-bar crop
 Rate control: CRF 27 (quality-based) capped at the old QSV max bitrate for
 each quality, so busy scenes can never blow up the file size.
-Quality: 10-bit (Main10), preset slower, 480p/720p tuned with ctu=32 + qg-size=16.
+Quality: 10-bit (Main10), preset slow, 480p/720p tuned with ctu=32 + qg-size=16.
 
 Local use: put videos in Encode_Input/, run `py LowEncoder.py`, pick a quality.
 GitHub use: split_encode.py imports this file for its settings (ENCODER_MODULE=LowEncoder).
@@ -32,7 +32,7 @@ INPUT_FOLDER = "Encode_Input"
 OUTPUT_FOLDER = "Encode_Output"
 
 CRF = 27                  # higher = smaller file. 27 = small but clean for HEVC
-X265_PRESET = "slower"    # medium / slow / slower / veryslow (MOVIES.py used veryslow on QSV)
+X265_PRESET = "slow"      # medium / slow / slower / veryslow. slower = a bit better but ~3x the time
 TEN_BIT = True            # HEVC Main10: more quality per MB + no banding (needs a 10-bit capable player)
 
 # x265 settings matching MOVIES.py + extras for better quality per MB
