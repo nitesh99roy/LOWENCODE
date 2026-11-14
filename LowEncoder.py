@@ -16,8 +16,10 @@ GitHub use: split_encode.py imports this file for its settings (ENCODER_MODULE=L
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -158,7 +160,7 @@ def probe(path):
     """One ffprobe call: main video stream, duration, audio channels, subtitles, attachments."""
     cmd = ["ffprobe", "-v", "error", "-show_entries",
            "format=duration:stream=index,codec_type,codec_name,width,height,channels,"
-           "sample_aspect_ratio:stream_disposition=attached_pic",
+           "sample_aspect_ratio:stream_disposition=attached_pic:stream_tags=filename,mimetype",
            "-of", "json", path]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
@@ -186,7 +188,43 @@ def probe(path):
         "subs": [{"index": s["index"], "codec": s.get("codec_name", "")}
                  for s in streams if s.get("codec_type") == "subtitle"],
         "has_attachments": any(s.get("codec_type") == "attachment" for s in streams),
+        "n_attachments": sum(1 for s in streams if s.get("codec_type") == "attachment"),
+        # Cover image(s): MKV image attachments, which ffmpeg shows as picture streams
+        "pics": [cover_info(s) for s in streams if s.get("codec_type") == "video"
+                 and s.get("disposition", {}).get("attached_pic")],
     }
+
+
+def cover_info(s):
+    tags = {k.lower(): v for k, v in (s.get("tags") or {}).items()}
+    ext = {"mjpeg": "jpg", "bmp": "bmp", "webp": "webp", "gif": "gif"}.get(s.get("codec_name"), "png")
+    return {"index": s["index"], "ext": ext,
+            "filename": tags.get("filename") or f"cover.{ext}",
+            "mimetype": tags.get("mimetype") or ("image/jpeg" if ext == "jpg" else f"image/{ext}")}
+
+
+def dump_covers(source, info, folder):
+    """Save the source's cover image(s) to files so they can be attached to the output.
+    (Copying the picture stream instead would turn it into a second video track.)"""
+    covers = []
+    for i, p in enumerate(info.get("pics", [])):
+        path = os.path.join(folder, f"cover_{i}.{p['ext']}")
+        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", source,
+                            "-map", f"0:{p['index']}", "-c", "copy", "-frames:v", "1",
+                            "-f", "image2", path])
+        if r.returncode == 0 and os.path.exists(path):
+            covers.append({"path": path, "filename": p["filename"], "mimetype": p["mimetype"]})
+    return covers
+
+
+def cover_attach_args(covers, first_attachment):
+    """-attach args; first_attachment = attachment streams already in the output (fonts)."""
+    args = []
+    for i, c in enumerate(covers):
+        k = first_attachment + i
+        args += ["-attach", c["path"], f"-metadata:s:t:{k}", f"mimetype={c['mimetype']}",
+                 f"-metadata:s:t:{k}", f"filename={c['filename']}"]
+    return args
 
 
 def smart_crop_detect(input_path, info):
@@ -340,12 +378,15 @@ def encode_file(video, input_dir, output_dir, tag, enable_crop):
         cmd += [f"-c:s:{i}", "srt" if s["codec"] in SUBS_TO_SRT else "copy"]
     if info["subs"] and DEFAULT_FIRST_SUBTITLE:
         cmd += ["-disposition:s:0", "default"]
+    cover_dir = tempfile.mkdtemp(prefix="covers_")
+    cmd += cover_attach_args(dump_covers(source, info, cover_dir), info.get("n_attachments", 0))
     cmd += ["-max_muxing_queue_size", "4096", part]
 
     print(f"🚀 {tag} {w}x{h} | {describe()}")
     print(" ".join(f'"{c}"' if " " in c else c for c in cmd))
     try:
         rc, lines = run_ffmpeg(cmd)
+        shutil.rmtree(cover_dir, ignore_errors=True)
         if rc != 0 or not os.path.exists(part) or os.path.getsize(part) < 1024:
             log = os.path.join(output_dir, f"error_log_{re.sub(r'[^A-Za-z0-9]', '_', base)}.txt")
             with open(log, "w", encoding="utf-8") as f:

@@ -210,6 +210,45 @@ def probe_timing(src, vindex):
     return fmt_start, vstart, fps
 
 
+def detect_cfr(src, vindex, vstart, duration):
+    """Exact frame rate (e.g. '24000/1001') if the video is really constant frame rate,
+    else None. Then every piece gets clean timestamps (frame n -> n / fps), which also
+    repairs timestamp glitches copied from the source. Checked by counting frames:
+    the count must match (last timestamp x fps), so variable frame rate video is never
+    retimed (that would drift out of sync)."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", str(vindex), "-count_packets",
+                        "-show_entries", "stream=r_frame_rate,nb_read_packets,duration",
+                        "-of", "json", src], capture_output=True, text=True)
+    try:
+        s = json.loads(r.stdout)["streams"][0]
+    except (ValueError, KeyError, IndexError):
+        return None
+    rate = s.get("r_frame_rate", "0/0")
+    fps = ratio(rate)
+    frames = int(s.get("nb_read_packets") or 0)
+    if fps <= 0 or frames <= 0:
+        return None
+    # Last video timestamp: read only the end of the file
+    end = probe_end(src, vindex, duration)
+    if end is None:
+        return None
+    expected = (end - vstart) * fps + 1
+    if abs(frames - expected) <= 2 + frames * 0.00002:
+        print(f"⏱️  Constant {fps:.3f} fps ({frames} frames) - timestamps will be rebuilt cleanly")
+        return rate
+    print(f"⏱️  Variable frame rate ({frames} frames vs {expected:.0f} expected) - keeping original timestamps")
+    return None
+
+
+def probe_end(src, vindex, duration):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", str(vindex),
+                        "-read_intervals", f"{max(0.0, duration - 60):.3f}%",
+                        "-show_entries", "packet=pts_time", "-of", "csv=p=0", src],
+                       capture_output=True, text=True)
+    pts = [float(x) for x in r.stdout.split() if x.strip() not in ("", "N/A")]
+    return max(pts) if pts else None
+
+
 def cut_piece(src, plan, p):
     """Stream-copy one piece (video only) with EDGE seconds extra, original timestamps + offset."""
     out = os.path.join(WORK, f"chunk_{p['index']:03d}.mkv")
@@ -269,6 +308,7 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
         die("ffprobe could not read the source file")
     fmt_start, vstart, fps = probe_timing(src, info["vindex"])
     duration = info["duration"]
+    cfr_rate = detect_cfr(src, info["vindex"], vstart, duration)
     if duration <= 0:
         die("could not read the video duration")
     print(f"📐 {os.path.basename(src)}: {info['width']}x{info['height']} @ {fps:.3f} fps, "
@@ -316,12 +356,18 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
         base = os.path.splitext(base)[0]
     plan = {
         "source": os.path.basename(src), "base": base, "duration": duration,
-        "fmt_start": fmt_start, "vstart": vstart, "fps": fps,
+        "fmt_start": fmt_start, "vstart": vstart, "fps": fps, "cfr_rate": cfr_rate,
         "vindex": info["vindex"], "sar": info["sar"], "crop": crop, "tags": tags,
         "pieces": pieces, "info": info,
         "has_extras": bool(info["audio"] or info["subs"] or info["has_attachments"]),
         "outputs": {t: output_name(base, t) for t in tags},
     }
+    # Cover image(s): saved as files now, attached to the output when joining
+    covers = CE.dump_covers(src, info, WORK) if hasattr(CE, "dump_covers") else []
+    plan["covers"] = [{"file": os.path.basename(c["path"]), "filename": c["filename"],
+                       "mimetype": c["mimetype"]} for c in covers]
+    if covers:
+        print(f"🖼️  Cover image: {', '.join(c['filename'] for c in covers)}")
     os.makedirs(WORK, exist_ok=True)
     plan_path = os.path.join(WORK, "plan.json")
     with open(plan_path, "w", encoding="utf-8") as f:
@@ -331,6 +377,8 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
     for t, o in plan["outputs"].items():
         print(f"   {t} -> {o}")
     store_upload(plan_path)
+    for c in covers:
+        store_upload(c["path"])
 
     start = time.time()
     with ThreadPoolExecutor(1) as audio_pool:
@@ -362,7 +410,10 @@ def cmd_encode(index):
         trim.append(f"start={p['start'] + TS_OFFSET:.6f}")
     if p["end"] is not None:
         trim.append(f"end={p['end'] + TS_OFFSET:.6f}")
-    chain = (["trim=" + ":".join(trim)] if trim else []) + ["setpts=PTS-STARTPTS"]
+    # Constant frame rate: clean timestamps from the frame number (repairs source glitches).
+    # Otherwise keep the source timing, just starting the piece at 0.
+    retime = f"setpts=N/({plan['cfr_rate']})/TB" if plan.get("cfr_rate") else "setpts=PTS-STARTPTS"
+    chain = (["trim=" + ":".join(trim)] if trim else []) + [retime]
     if plan["crop"]:
         chain.append(plan["crop"]["ffmpeg_crop"])
     if abs(plan["sar"] - 1.0) > 0.01:
@@ -421,6 +472,9 @@ def interleave_lead(path):
     r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type",
                         "-of", "csv=p=0", path], capture_output=True, text=True)
     kinds = dict(line.split(",")[:2] for line in r.stdout.split() if "," in line)
+    # Only the main video (first video stream) - a cover image is also a "video" stream
+    main_video = next((k for k, v in kinds.items() if v == "video"), None)
+    kinds = {k: ("main" if k == main_video else v) for k, v in kinds.items()}
     p = subprocess.Popen(["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time",
                           "-of", "csv=p=0", path], stdout=subprocess.PIPE, text=True)
     max_audio, worst = 0.0, 0.0
@@ -431,7 +485,7 @@ def interleave_lead(path):
         kind, t = kinds.get(parts[0]), float(parts[1])
         if kind == "audio":
             max_audio = max(max_audio, t)
-        elif kind == "video":
+        elif kind == "main":
             worst = max(worst, max_audio - t)
     p.wait()
     return worst
@@ -444,6 +498,11 @@ def cmd_merge():
         plan = json.load(f)
     if plan["has_extras"]:
         store_download(["extras_*"], d)
+    covers = [dict(c, path=os.path.join(d, c["file"])) for c in plan.get("covers", [])]
+    if covers:
+        store_download([c["file"] for c in covers], d)
+    # Fonts (attachments) come in through the extras file, covers are attached after them
+    fonts = plan["info"].get("n_attachments", 0) if plan["has_extras"] else 0
 
     out_dir = os.path.join(WORK, "out")
     os.makedirs(out_dir, exist_ok=True)
@@ -470,6 +529,8 @@ def cmd_merge():
         else:
             args += ["-map", "0:v"]
         args += ["-c", "copy"]
+        if covers:
+            args += CE.cover_attach_args(covers, fonts)
         if plan["info"]["subs"] and CE.DEFAULT_FIRST_SUBTITLE:
             args += ["-disposition:s:0", "default"]
         # Strict interleaving: never write audio ahead of video. Without this the muxer
