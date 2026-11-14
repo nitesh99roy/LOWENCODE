@@ -18,6 +18,10 @@ on:
         type: choice
         options: [480p, 720p, 1080p]
         default: 480p
+      audio:
+        description: "Audio languages to keep: all, or e.g. eng / hin,eng"
+        required: true
+        default: "all"
       crf:
         description: "CRF (higher = smaller file, lower = better quality)"
         required: true
@@ -56,6 +60,7 @@ env:
   CRF: ${{ inputs.crf }}
   X265_PRESET: ${{ inputs.preset }}
   TEN_BIT: ${{ inputs.ten_bit }}
+  AUDIO_LANGS: ${{ inputs.audio }}
   PYTHONUNBUFFERED: "1"
   FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
 

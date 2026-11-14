@@ -61,6 +61,47 @@ if hasattr(CE, "X264_PRESET"):
         CE.X264_ADVANCED = os.environ["X264_ADVANCED"].lower() == "true"
 
 
+# Audio languages to keep: AUDIO_LANGS="eng" or "hin,eng" or "all" (default).
+# Matches the track's language tag, or its title ("English", "Hindi", ...).
+LANG_NAMES = {"eng": "english", "hin": "hindi", "tam": "tamil", "tel": "telugu", "mal": "malayalam",
+              "kan": "kannada", "ben": "bengali", "mar": "marathi", "guj": "gujarati",
+              "pan": "punjabi", "urd": "urdu", "jpn": "japanese", "kor": "korean",
+              "spa": "spanish", "fre": "french", "ger": "german", "chi": "chinese"}
+LANG_SHORT = {"en": "eng", "hi": "hin", "ta": "tam", "te": "tel", "ml": "mal", "kn": "kan",
+              "bn": "ben", "mr": "mar", "gu": "guj", "pa": "pan", "ur": "urd", "ja": "jpn",
+              "ko": "kor", "es": "spa", "fr": "fre", "de": "ger", "zh": "chi"}
+
+
+def wanted_languages():
+    raw = os.environ.get("AUDIO_LANGS", "all").strip().lower()
+    if raw in ("", "all", "*"):
+        return None
+    codes = set()
+    full = {v: k for k, v in LANG_NAMES.items()}
+    for item in (x.strip() for x in raw.split(",") if x.strip()):
+        codes.add(LANG_SHORT.get(item) or full.get(item) or item)
+    return codes
+
+
+def select_audio(tracks):
+    """Audio tracks to keep, based on AUDIO_LANGS. Never returns an empty list
+    when the source has audio: if nothing matches, every track is kept."""
+    want = wanted_languages()
+    if not want or not tracks:
+        return tracks
+    picked = []
+    for a in tracks:
+        lang = (a.get("language") or "").lower()
+        title = (a.get("title") or "").lower()
+        if lang in want or any(LANG_NAMES.get(w, w) in title for w in want):
+            picked.append(a)
+    if not picked:
+        found = ", ".join(f"{a.get('language') or '?'} ({a.get('title') or 'no title'})" for a in tracks)
+        print(f"::warning::No audio track matches '{','.join(sorted(want))}' - keeping all. Tracks: {found}")
+        return tracks
+    return picked
+
+
 def describe_settings():
     if hasattr(CE, "describe"):
         return CE.describe()
@@ -273,13 +314,19 @@ def make_extras(src, plan):
     if not plan["has_extras"]:
         print("ℹ️  No audio/subtitles in source - nothing to add later")
         return
+    audio = plan.get("audio", info["audio"])
+    filtered = len(audio) < len(info["audio"])
     args = ["-i", src]
     outs = []
     for tag in plan["tags"]:
         fmt = CE.FORMATS[tag]
         out = os.path.join(WORK, f"extras_{tag}.mkv")
         outs.append(out)
-        args += ["-map", "0:a?"]
+        if filtered:
+            for a in audio:
+                args += ["-map", f"0:{a['index']}"]
+        else:
+            args += ["-map", "0:a?"]
         for s in info["subs"]:
             args += ["-map", f"0:{s['index']}"]
         if info["has_attachments"]:
@@ -287,9 +334,11 @@ def make_extras(src, plan):
         args += ["-map_metadata", "0", "-map_chapters", "0",
                  "-c:a", "aac", "-b:a", fmt["audio_bitrate"]]
         if fmt["audio_channels"]:
-            for i, a in enumerate(info["audio"]):
+            for i, a in enumerate(audio):
                 if a["channels"] > fmt["audio_channels"]:
                     args += [f"-ac:a:{i}", str(fmt["audio_channels"])]
+        if filtered and audio:
+            args += ["-disposition:a:0", "default"]   # kept track plays by default
         for i, s in enumerate(info["subs"]):
             args += [f"-c:s:{i}", "srt" if s["codec"] in CE.SUBS_TO_SRT else "copy"]
         if info["has_attachments"]:
@@ -362,6 +411,13 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
         "has_extras": bool(info["audio"] or info["subs"] or info["has_attachments"]),
         "outputs": {t: output_name(base, t) for t in tags},
     }
+    # Audio tracks to keep (AUDIO_LANGS)
+    plan["audio"] = select_audio(info["audio"])
+    if info["audio"]:
+        kept = ", ".join(f"{a.get('language') or '?'}" + (f" ({a['title']})" if a.get("title") else "")
+                         for a in plan["audio"])
+        print(f"🔊 Audio: keeping {len(plan['audio'])} of {len(info['audio'])} track(s): {kept}")
+
     # Cover image(s): saved as files now, attached to the output when joining
     covers = CE.dump_covers(src, info, WORK) if hasattr(CE, "dump_covers") else []
     plan["covers"] = [{"file": os.path.basename(c["path"]), "filename": c["filename"],

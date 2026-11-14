@@ -160,7 +160,8 @@ def probe(path):
     """One ffprobe call: main video stream, duration, audio channels, subtitles, attachments."""
     cmd = ["ffprobe", "-v", "error", "-show_entries",
            "format=duration:stream=index,codec_type,codec_name,width,height,channels,"
-           "sample_aspect_ratio:stream_disposition=attached_pic:stream_tags=filename,mimetype",
+           "sample_aspect_ratio:stream_disposition=attached_pic"
+           ":stream_tags=filename,mimetype,language,title",
            "-of", "json", path]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
@@ -183,7 +184,9 @@ def probe(path):
     return {
         "vindex": v["index"], "width": int(v["width"]), "height": int(v["height"]),
         "sar": parse_ratio(v.get("sample_aspect_ratio", "1:1")), "duration": duration,
-        "audio": [{"channels": int(s.get("channels") or 0)}
+        "audio": [{"index": s["index"], "channels": int(s.get("channels") or 0),
+                   "language": (s.get("tags") or {}).get("language", ""),
+                   "title": (s.get("tags") or {}).get("title", "")}
                   for s in streams if s.get("codec_type") == "audio"],
         "subs": [{"index": s["index"], "codec": s.get("codec_name", "")}
                  for s in streams if s.get("codec_type") == "subtitle"],
