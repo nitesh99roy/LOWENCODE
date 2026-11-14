@@ -450,7 +450,10 @@ def cmd_merge():
         args += ["-c", "copy"]
         if plan["info"]["subs"] and CE.DEFAULT_FIRST_SUBTITLE:
             args += ["-disposition:s:0", "default"]
-        args += ["-max_muxing_queue_size", "4096", out]
+        # Strict interleaving: never write audio ahead of video. Without this the muxer
+        # gives up waiting after 10 s and writes audio up to minutes ahead, which makes
+        # players drop the audio for a few seconds at those points.
+        args += ["-max_interleave_delta", "0", "-max_muxing_queue_size", "4096", out]
         ffmpeg(args, f"join {t}")
 
         got = media_duration(out)
