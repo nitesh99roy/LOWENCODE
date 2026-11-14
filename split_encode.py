@@ -54,8 +54,11 @@ MAX_ASSET = 1800 * 1024 * 1024          # release assets must stay under 2 GB
 
 if hasattr(CE, "apply_env"):
     CE.apply_env()
-if hasattr(CE, "X264_PRESET"):
-    CE.X264_PRESET = os.environ.get("X264_PRESET") or CE.X264_PRESET
+if hasattr(CE, "PRESET_OVERRIDE"):
+    # Workflow "preset" input: "per-format" (default) keeps each format's own preset
+    chosen = os.environ.get("X264_PRESET", "")
+    CE.PRESET_OVERRIDE = "" if chosen in ("", "per-format") else chosen
+if hasattr(CE, "X264_TUNE"):
     if "X264_TUNE" in os.environ:
         CE.X264_TUNE = "" if os.environ["X264_TUNE"] in ("", "none") else os.environ["X264_TUNE"]
     if "X264_ADVANCED" in os.environ:
@@ -136,7 +139,7 @@ def scale_chain(plan, t):
 def describe_settings():
     if hasattr(CE, "describe"):
         return CE.describe()
-    return (f"preset: {CE.X264_PRESET} | tune: {CE.X264_TUNE or 'none'} | "
+    return (f"presets: {CE.presets_text()} | tune: {CE.X264_TUNE or 'none'} | "
             f"advanced: {'on' if CE.X264_ADVANCED else 'off'} | size: {getattr(CE, 'SIZE_MODE', 'crf')}")
 
 
