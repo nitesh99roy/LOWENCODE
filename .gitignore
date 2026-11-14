@@ -1,0 +1,20 @@
+# Video files never go into git (GitHub max is 100 MB per file)
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.ts
+*.m2ts
+*.webm
+testfiles/
+Encode_Input/
+Encode_Output/
+work/
+
+# Local state
+qsv_capabilities.json
+conversiontime.txt
+error_log_*.txt
+__pycache__/
+*.pyc
