@@ -31,6 +31,7 @@ import importlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -102,11 +103,41 @@ def select_audio(tracks):
     return picked
 
 
+if hasattr(CE, "SIZE_MODE") and os.environ.get("SIZE_MODE"):
+    CE.SIZE_MODE = os.environ["SIZE_MODE"]
+
+
+def vlabel(tag):
+    """Filter-graph label for a format (labels can't contain dots, e.g. 720p.10BIT)."""
+    return "v_" + re.sub(r"\W", "_", tag)
+
+
+def pre_filters(plan):
+    """Crop + anamorphic fix, applied before splitting into the formats."""
+    pre = []
+    if plan["crop"]:
+        pre.append(plan["crop"]["ffmpeg_crop"])
+    if abs(plan["sar"] - 1.0) > 0.01:
+        pre.append("scale='trunc(iw*sar/2)*2':ih")
+    return pre
+
+
+def scale_chain(plan, t):
+    """Resize (+ pixel format) for one format."""
+    eff_w = (plan["crop"]["w"] if plan["crop"] else plan["info"]["width"]) * plan["sar"]
+    eff_h = plan["crop"]["h"] if plan["crop"] else plan["info"]["height"]
+    if hasattr(CE, "scale_filter"):
+        return CE.scale_filter(t, eff_w, eff_h)
+    bw, bh = CE.FORMATS[t]["box"]
+    return (f"scale={bw}:{bh}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+            f":flags=lanczos,setsar=1,format=yuv420p")
+
+
 def describe_settings():
     if hasattr(CE, "describe"):
         return CE.describe()
     return (f"preset: {CE.X264_PRESET} | tune: {CE.X264_TUNE or 'none'} | "
-            f"advanced: {'on' if CE.X264_ADVANCED else 'off'}")
+            f"advanced: {'on' if CE.X264_ADVANCED else 'off'} | size: {getattr(CE, 'SIZE_MODE', 'crf')}")
 
 
 def output_name(base, tag):
@@ -350,6 +381,55 @@ def make_extras(src, plan):
         store_upload(out)
 
 
+def probe_crf(src, plan):
+    """Target-size mode: encode a short sample of the movie (8 x 3 s from across it) with the
+    real settings, measure the bitrate, and pick the CRF per format that lands on its target.
+    x264/x265 rule: +6 CRF = half the bitrate. The CRF is kept inside a quality range, so a
+    very hard movie goes a bit over the target instead of looking bad, and an easy movie
+    comes in under it instead of wasting bits."""
+    tags = plan["tags"]
+    if getattr(CE, "SIZE_MODE", "crf") != "target" or \
+            not all(CE.FORMATS[t].get("target_kbps") for t in tags):
+        return {}
+    dur = plan["duration"]
+    n, seg = (8, 3.0) if dur >= 120 else (1, min(dur, 30.0))
+    starts = [dur * (0.05 + 0.9 * i / (n - 1)) for i in range(n)] if n > 1 else [0.0]
+    args = []
+    for s in starts:
+        args += ["-ss", f"{s:.2f}", "-t", f"{seg}", "-i", src]
+    head = "".join(f"[{i}:{plan['vindex']}]" for i in range(n)) + f"concat=n={n}:v=1:a=0"
+    pre = pre_filters(plan)
+    if pre:
+        head += "," + ",".join(pre)
+    graph = [f"{head},split={len(tags)}" + "".join(f"[p{i}]" for i in range(len(tags)))]
+    graph += [f"[p{i}]{scale_chain(plan, t)}[o{i}]" for i, t in enumerate(tags)]
+    outs = {t: os.path.join(WORK, f"sizetest_{re.sub(r'[^A-Za-z0-9]', '_', t)}.mkv") for t in tags}
+    args += ["-filter_complex", ";".join(graph)]
+    for i, t in enumerate(tags):
+        args += ["-map", f"[o{i}]"] + CE.video_args(t) + ["-f", "matroska", outs[t]]
+    start = time.time()
+    ffmpeg(args, "size test")
+
+    crfs = {}
+    for t in tags:
+        fmt = CE.FORMATS[t]
+        kbps = os.path.getsize(outs[t]) * 8 / (n * seg) / 1000
+        os.remove(outs[t])
+        lo, hi = (18, 30) if fmt.get("codec") == "x265" else (16, 26)
+        want = fmt["crf"] + 6 * math.log2(max(kbps, 1) / fmt["target_kbps"])
+        crf = round(min(hi, max(lo, want)), 1)
+        note = ""
+        if want > hi:
+            note = f" (capped at CRF {hi} to protect quality - file will be above target)"
+        elif want < lo:
+            note = f" (easy video - will come in under target)"
+        print(f"🎯 {t}: sample {kbps:.0f} kbps at CRF {fmt['crf']} -> CRF {crf} "
+              f"for {fmt['target_kbps']} kbps target{note}", flush=True)
+        crfs[t] = crf
+    print(f"🎯 Size test done in {CE.format_time(time.time() - start)}")
+    return crfs
+
+
 def cmd_prepare(chunks_req, formats, crop_flag, name=""):
     src = find_source()
     info = CE.probe(src)
@@ -426,22 +506,27 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
         print(f"🖼️  Cover image: {', '.join(c['filename'] for c in covers)}")
     os.makedirs(WORK, exist_ok=True)
     plan_path = os.path.join(WORK, "plan.json")
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2)
     print(f"🧩 {n} pieces of ~{CE.format_time(step)} | formats: {' + '.join(tags)} | "
           f"crop: {crop['ffmpeg_crop'] if crop else 'none'} | {describe_settings()}")
     for t, o in plan["outputs"].items():
         print(f"   {t} -> {o}")
-    store_upload(plan_path)
     for c in covers:
         store_upload(c["path"])
 
+    # Cutting/uploading pieces (disk + network), audio and the size test (CPU) run together
     start = time.time()
-    with ThreadPoolExecutor(1) as audio_pool:
-        audio_job = audio_pool.submit(make_extras, src, plan)
+    with ThreadPoolExecutor(2) as side:
+        audio_job = side.submit(make_extras, src, plan)
+        size_job = side.submit(probe_crf, src, plan)
         with ThreadPoolExecutor(3) as pool:
             list(pool.map(lambda p: cut_piece(src, plan, p), pieces))
         audio_job.result()
+        plan["crf"] = size_job.result()
+    plan["size_mode"] = getattr(CE, "SIZE_MODE", "crf")
+    # The plan goes up last: encode jobs start only after this job, and need the CRFs
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump(plan, f, indent=2)
+    store_upload(plan_path)
     print(f"✅ Prepared in {CE.format_time(time.time() - start)}")
 
     set_output("matrix", json.dumps(list(range(n))))
@@ -469,21 +554,16 @@ def cmd_encode(index):
     # Constant frame rate: clean timestamps from the frame number (repairs source glitches).
     # Otherwise keep the source timing, just starting the piece at 0.
     retime = f"setpts=N/({plan['cfr_rate']})/TB" if plan.get("cfr_rate") else "setpts=PTS-STARTPTS"
-    chain = (["trim=" + ":".join(trim)] if trim else []) + [retime]
-    if plan["crop"]:
-        chain.append(plan["crop"]["ffmpeg_crop"])
-    if abs(plan["sar"] - 1.0) > 0.01:
-        chain.append("scale='trunc(iw*sar/2)*2':ih")
+    chain = (["trim=" + ":".join(trim)] if trim else []) + [retime] + pre_filters(plan)
 
-    eff_w = (plan["crop"]["w"] if plan["crop"] else plan["info"]["width"]) * plan["sar"]
-    eff_h = plan["crop"]["h"] if plan["crop"] else plan["info"]["height"]
+    # Size mode + the CRFs picked by the size test in the prepare job
+    if hasattr(CE, "SIZE_MODE"):
+        CE.SIZE_MODE = plan.get("size_mode", CE.SIZE_MODE)
+    if hasattr(CE, "CRF_OVERRIDE"):
+        CE.CRF_OVERRIDE = plan.get("crf") or {}
 
     def scale(t):
-        if hasattr(CE, "scale_filter"):
-            return CE.scale_filter(t, eff_w, eff_h) + f"[v_{t}]"
-        bw, bh = CE.FORMATS[t]["box"]
-        return (f"scale={bw}:{bh}:force_original_aspect_ratio=decrease:force_divisible_by=2"
-                f":flags=lanczos,setsar=1,format=yuv420p[v_{t}]")
+        return f"{scale_chain(plan, t)}[{vlabel(t)}]"
 
     head = "[0:v:0]" + ",".join(chain)
     if len(tags) == 1:
@@ -496,11 +576,10 @@ def cmd_encode(index):
     args = ["-copyts", "-i", os.path.join(d, f"chunk_{k:03d}.mkv"), "-filter_complex", graph]
     outs = []
     for t in tags:
-        fmt = CE.FORMATS[t]
         out = os.path.join(d, f"piece_{t}_{k:03d}.mkv")
         outs.append(out)
         vargs = CE.video_args(t) if hasattr(CE, "video_args") else CE.x264_args(t)
-        args += ["-map", f"[v_{t}]"] + vargs + ["-fps_mode", "passthrough", out]
+        args += ["-map", f"[{vlabel(t)}]"] + vargs + ["-fps_mode", "passthrough", out]
 
     start = time.time()
     ffmpeg(args, f"piece {k}")
@@ -600,6 +679,10 @@ def cmd_merge():
             print(f"::warning::{os.path.basename(out)} is {got:.2f}s but the source is "
                   f"{plan['duration']:.2f}s - please check it")
         print(f"✅ {os.path.basename(out)}: {mb(out)}, {CE.format_time(got)}")
+        video_kbps = sum(os.path.getsize(p) for p in pieces) * 8 / max(plan["duration"], 1) / 1000
+        target = CE.FORMATS[t].get("target_kbps") if plan.get("size_mode") == "target" else None
+        crf = (plan.get("crf") or {}).get(t)
+        print(f"🎯 {t} video: {video_kbps:.0f} kbps" + (f" (target {target}, CRF {crf})" if target else ""))
         lead = interleave_lead(out)
         if lead > 2:
             print(f"::warning::{os.path.basename(out)}: audio is written up to {lead:.1f}s ahead of "
