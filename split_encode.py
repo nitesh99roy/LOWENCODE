@@ -21,6 +21,8 @@ Commands:
   download <url>                             fetch the source into $WORK/src/
   prepare  <chunks> <formats> <crop> [name]  plan, cut + upload pieces, encode audio
   encode   <index>                           encode one piece into every resolution
+  audio                                      encode the full-length audio (own runner, in
+                                             parallel with the video pieces)
   merge                                      join pieces + audio/subs/chapters -> $WORK/out/
   publish                                    put the results in a draft release
   gofile                                     upload the results to one Gofile folder
@@ -50,7 +52,7 @@ TS_OFFSET = 1000.0                      # added to piece timestamps so they are 
 EDGE = 5.0                              # extra seconds cut on each side of a piece
 MIN_PIECE_SEC = float(os.environ.get("MIN_PIECE_SEC", "30"))
 MAX_PIECES = 20                         # GitHub Free runs at most 20 jobs at once
-MAX_ASSET = 1800 * 1024 * 1024          # release assets must stay under 2 GB
+MAX_ASSET = int(os.environ.get("MAX_ASSET_MB", "1800")) * 1024 * 1024   # release assets < 2 GB
 
 if hasattr(CE, "apply_env"):
     CE.apply_env()
@@ -239,6 +241,46 @@ def store_download(patterns, dest):
     die(f"could not download {patterns}")
 
 
+def store_upload_big(path):
+    """Upload a file that may be bigger than the 2 GB asset limit: split into
+    <name>.part00, .part01 ... (byte split, rejoined exactly by store_download_big)."""
+    if os.path.getsize(path) <= MAX_ASSET:
+        store_upload(path)
+        return
+    n = 0
+    with open(path, "rb") as src:
+        while True:
+            part = f"{path}.part{n:02d}"
+            written = 0
+            with open(part, "wb") as dst:
+                while written < MAX_ASSET:
+                    buf = src.read(min(64 << 20, MAX_ASSET - written))
+                    if not buf:
+                        break
+                    dst.write(buf)
+                    written += len(buf)
+            if written == 0:
+                os.remove(part)
+                break
+            store_upload(part)
+            os.remove(part)
+            n += 1
+    print(f"📦 {os.path.basename(path)} uploaded in {n} parts")
+
+
+def store_download_big(name, dest):
+    """Download a file uploaded with store_upload_big and rejoin its parts."""
+    store_download([name + "*"], dest)
+    parts = sorted(f for f in os.listdir(dest) if f.startswith(name + ".part"))
+    if parts:
+        with open(os.path.join(dest, name), "wb") as out:
+            for p in parts:
+                with open(os.path.join(dest, p), "rb") as f:
+                    shutil.copyfileobj(f, out, 64 << 20)
+                os.remove(os.path.join(dest, p))
+    return os.path.join(dest, name)
+
+
 # -------------------------------------------------------------------------------
 # download
 # -------------------------------------------------------------------------------
@@ -342,29 +384,63 @@ def cut_piece(src, plan, p):
     os.remove(out)
 
 
-def make_extras(src, plan):
-    """Encode the complete audio once per resolution + copy subtitles/chapters/attachments."""
+AUDIO_SOURCE = "audiosrc.mkv"
+
+
+def extract_audio_source(src, plan):
+    """For the separate audio job: COPY (no re-encoding, takes seconds) the kept audio tracks,
+    subtitles, fonts, chapters and metadata into one file and upload it. Timestamps are written
+    relative to the source's start exactly like before, so any audio delay is kept."""
+    info = plan["info"]
+    if not plan["has_extras"]:
+        return
+    out = os.path.join(WORK, AUDIO_SOURCE)
+    args = ["-i", src]
+    for a in plan.get("audio", info["audio"]):
+        args += ["-map", f"0:{a['index']}"]
+    for s in info["subs"]:
+        args += ["-map", f"0:{s['index']}"]
+    if info["has_attachments"]:
+        args += ["-map", "0:t?"]
+    args += ["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"]
+    for i, s in enumerate(info["subs"]):
+        if s["codec"] in CE.SUBS_TO_SRT:          # MKV can't hold these as-is
+            args += [f"-c:s:{i}", "srt"]
+    args += [out]
+    ffmpeg(args, "copy audio")
+    print(f"🔊 Audio copied for the audio job: {mb(out)}", flush=True)
+    store_upload_big(out)
+    os.remove(out)
+
+
+def make_extras(src, plan, copied=False):
+    """Encode the complete audio once per format + copy subtitles/chapters/attachments.
+    copied=True: src is the audio-only copy from extract_audio_source (audio job)."""
     info = plan["info"]
     if not plan["has_extras"]:
         print("ℹ️  No audio/subtitles in source - nothing to add later")
         return
     audio = plan.get("audio", info["audio"])
     filtered = len(audio) < len(info["audio"])
-    args = ["-i", src]
+    # -copyts: the copy already has its timestamps relative to the source's start
+    args = (["-copyts"] if copied else []) + ["-i", src]
     outs = []
     for tag in plan["tags"]:
         fmt = CE.FORMATS[tag]
         out = os.path.join(WORK, f"extras_{tag}.mkv")
         outs.append(out)
-        if filtered:
-            for a in audio:
-                args += ["-map", f"0:{a['index']}"]
+        if copied:                    # the copy holds exactly the kept tracks, in order
+            args += ["-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
         else:
-            args += ["-map", "0:a?"]
-        for s in info["subs"]:
-            args += ["-map", f"0:{s['index']}"]
-        if info["has_attachments"]:
-            args += ["-map", "0:t?"]
+            if filtered:
+                for a in audio:
+                    args += ["-map", f"0:{a['index']}"]
+            else:
+                args += ["-map", "0:a?"]
+            for s in info["subs"]:
+                args += ["-map", f"0:{s['index']}"]
+            if info["has_attachments"]:
+                args += ["-map", "0:t?"]
         args += ["-map_metadata", "0", "-map_chapters", "0",
                  "-c:a", fmt.get("audio_codec", "aac"), "-b:a", fmt["audio_bitrate"]]
         if fmt["audio_channels"]:
@@ -374,7 +450,8 @@ def make_extras(src, plan):
         if filtered and audio:
             args += ["-disposition:a:0", "default"]   # kept track plays by default
         for i, s in enumerate(info["subs"]):
-            args += [f"-c:s:{i}", "srt" if s["codec"] in CE.SUBS_TO_SRT else "copy"]
+            conv = s["codec"] in CE.SUBS_TO_SRT and not copied
+            args += [f"-c:s:{i}", "srt" if conv else "copy"]
         if info["has_attachments"]:
             args += ["-c:t", "copy"]
         args += [out]
@@ -382,6 +459,24 @@ def make_extras(src, plan):
     for out in outs:
         print(f"🔊 {os.path.basename(out)}: {mb(out)}", flush=True)
         store_upload(out)
+
+
+def cmd_audio():
+    """Audio job: runs on its own runner at the same time as the video pieces. Encodes the
+    full-length audio (never split, so no joins in the sound) for every format."""
+    d = os.path.join(WORK, "audio")
+    store_download(["plan.json"], d)
+    with open(os.path.join(d, "plan.json"), encoding="utf-8") as f:
+        plan = json.load(f)
+    if not plan["has_extras"]:
+        print("ℹ️  No audio/subtitles in source - nothing to do")
+        return
+    start = time.time()
+    src = store_download_big(AUDIO_SOURCE, d)
+    print(f"🔊 Audio source: {mb(src)} | {len(plan.get('audio', []))} track(s) x {len(plan['tags'])} format(s)")
+    os.makedirs(WORK, exist_ok=True)
+    make_extras(src, plan, copied=True)
+    print(f"✅ Audio done in {CE.format_time(time.time() - start)}")
 
 
 def probe_crf(src, plan):
@@ -467,11 +562,16 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
     if not tags:
         die("every selected resolution is bigger than the source")
 
-    # Number of pieces: as asked, but each piece >= MIN_PIECE_SEC and < 2 GB
-    n = max(1, min(int(chunks_req), MAX_PIECES, int(duration // MIN_PIECE_SEC) or 1))
+    # Number of pieces: as asked, but each piece >= MIN_PIECE_SEC and < 2 GB.
+    # One runner is kept for the audio job (e.g. 20 -> 19 video pieces + 1 audio).
+    has_extras = bool(info["audio"] or info["subs"] or info["has_attachments"])
+    max_video = MAX_PIECES - 1 if has_extras else MAX_PIECES
+    n = max(1, min(int(chunks_req), max_video, int(duration // MIN_PIECE_SEC) or 1))
+    if has_extras and int(chunks_req) > max_video:
+        print(f"ℹ️  {n} video pieces + 1 audio job = {n + 1} runners at once")
     need = math.ceil(os.path.getsize(src) * 1.1 / MAX_ASSET)
     if need > n:
-        if need > MAX_PIECES:
+        if need > max_video:
             die("source is too large to split into release assets")
         print(f"ℹ️  Using {need} pieces so each stays under 2 GB")
         n = need
@@ -491,7 +591,7 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
         "fmt_start": fmt_start, "vstart": vstart, "fps": fps, "cfr_rate": cfr_rate,
         "vindex": info["vindex"], "sar": info["sar"], "crop": crop, "tags": tags,
         "pieces": pieces, "info": info,
-        "has_extras": bool(info["audio"] or info["subs"] or info["has_attachments"]),
+        "has_extras": has_extras,
         "outputs": {t: output_name(base, t) for t in tags},
     }
     # Audio tracks to keep (AUDIO_LANGS)
@@ -516,14 +616,16 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
     for c in covers:
         store_upload(c["path"])
 
-    # Cutting/uploading pieces (disk + network), audio and the size test (CPU) run together
+    # Cutting/uploading pieces, copying out the audio (both disk + network) and the size
+    # test (CPU) run together. The audio is ENCODED later by its own job, in parallel with
+    # the video pieces, so it no longer holds up the encoders.
     start = time.time()
     with ThreadPoolExecutor(2) as side:
-        audio_job = side.submit(make_extras, src, plan)
+        audio_copy = side.submit(extract_audio_source, src, plan)
         size_job = side.submit(probe_crf, src, plan)
         with ThreadPoolExecutor(3) as pool:
             list(pool.map(lambda p: cut_piece(src, plan, p), pieces))
-        audio_job.result()
+        audio_copy.result()
         plan["crf"] = size_job.result()
     plan["size_mode"] = getattr(CE, "SIZE_MODE", "crf")
     # The plan goes up last: encode jobs start only after this job, and need the CRFs
@@ -787,6 +889,7 @@ def main():
         die(__doc__)
     cmd, args = sys.argv[1], sys.argv[2:]
     commands = {"download": cmd_download, "prepare": cmd_prepare, "encode": cmd_encode,
+                "audio": cmd_audio,
                 "merge": cmd_merge, "publish": cmd_publish, "gofile": cmd_gofile,
                 "cleanup": cmd_cleanup}
     if cmd not in commands:

@@ -100,7 +100,7 @@ jobs:
             --title "split encode scratch ${{ github.run_id }}" \
             --notes "Temporary storage for a split encode - deleted automatically."
 
-      - name: Plan, cut pieces, encode audio
+      - name: Plan, cut pieces, copy audio
         id: plan
         env:
           CHUNKS: ${{ inputs.chunks }}
@@ -129,9 +129,34 @@ jobs:
       - name: Encode
         run: python3 split_encode.py encode ${{ matrix.chunk }}
 
+  # Runs at the same time as the video pieces (19 video + 1 audio = 20 runners)
+  audio:
+    name: Encode audio (full length)
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          curl -fsSL "$FFMPEG_URL" | tar -xJ -C /opt
+          echo "/opt/ffmpeg-master-latest-linux64-gpl/bin" >> "$GITHUB_PATH"
+
+      - name: Work folder on the large disk
+        run: |
+          if sudo mkdir -p /mnt/work && sudo chown "$(id -u):$(id -g)" /mnt/work; then
+            echo "WORK=/mnt/work" >> "$GITHUB_ENV"
+          else
+            echo "WORK=$GITHUB_WORKSPACE/work" >> "$GITHUB_ENV"
+          fi
+
+      - name: Encode audio
+        run: python3 split_encode.py audio
+
   merge:
     name: Join + add audio
-    needs: [prepare, encode]
+    needs: [prepare, encode, audio]
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -189,7 +214,7 @@ jobs:
 
   cleanup:
     name: Delete temporary release
-    needs: [prepare, encode, merge]
+    needs: [prepare, encode, audio, merge]
     # Kept when something failed, so "Re-run failed jobs" still finds the pieces
     if: always() && (needs.merge.result == 'success' || needs.prepare.result == 'failure' || cancelled())
     runs-on: ubuntu-latest
