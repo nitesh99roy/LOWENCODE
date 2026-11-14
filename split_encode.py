@@ -17,6 +17,14 @@ How the pieces stay seamless:
   * The crop is detected ONCE on the full file, so every piece has the same size.
   * Audio is encoded once from the full source (never split), so it has no gaps.
 
+Checks (a file is only uploaded when all of them pass):
+  * prepare reads the time of every video frame in the source. Timestamps are only
+    rebuilt when every frame sits on an even grid; otherwise the originals are kept.
+  * every encoder counts the frames of its piece against the plan before uploading.
+  * the join places each piece at its exact planned time, then reads the finished file:
+    frame count, the time of every frame, a keyframe at every join, a real decode around
+    every join, audio start / end / gaps against the source, audio-video write order.
+
 Commands:
   download <url>                             fetch the source into $WORK/src/
   prepare  <chunks> <formats> <crop> [name]  plan, cut + upload pieces, encode audio
@@ -29,6 +37,7 @@ Commands:
   cleanup                                    delete the temporary draft release
 """
 import fnmatch
+import hashlib
 import importlib
 import json
 import math
@@ -37,6 +46,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -322,48 +332,104 @@ def probe_timing(src, vindex):
     data = json.loads(r.stdout or "{}")
     fmt_start = float(data.get("format", {}).get("start_time") or 0)
     s = next(s for s in data["streams"] if s["index"] == vindex)
-    vstart = float(s.get("start_time") or fmt_start)
+    hints = [s.get("r_frame_rate") or "", s.get("avg_frame_rate") or ""]
     fps = ratio(s.get("avg_frame_rate")) or ratio(s.get("r_frame_rate")) or 24.0
-    return fmt_start, vstart, fps
+    return fmt_start, fps, hints
 
 
-def detect_cfr(src, vindex, vstart, duration):
-    """Exact frame rate (e.g. '24000/1001') if the video is really constant frame rate,
-    else None. Then every piece gets clean timestamps (frame n -> n / fps), which also
-    repairs timestamp glitches copied from the source. Checked by counting frames:
-    the count must match (last timestamp x fps), so variable frame rate video is never
-    retimed (that would drift out of sync)."""
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", str(vindex), "-count_packets",
-                        "-show_entries", "stream=r_frame_rate,nb_read_packets,duration",
-                        "-of", "json", src], capture_output=True, text=True)
-    try:
-        s = json.loads(r.stdout)["streams"][0]
-    except (ValueError, KeyError, IndexError):
+def scan_packets(path):
+    """Every packet of a file, in file order: (stream index, time, duration, is keyframe)."""
+    p = subprocess.Popen(["ffprobe", "-v", "error", "-show_entries",
+                          "packet=stream_index,pts_time,dts_time,duration_time,flags",
+                          "-of", "csv=p=0", path], stdout=subprocess.PIPE, text=True)
+    for line in p.stdout:
+        a = line.strip().split(",")
+        if len(a) < 3:
+            continue
+        ts = a[1] if a[1] not in ("", "N/A") else a[2]
+        try:
+            idx, t = int(a[0]), float(ts)
+        except ValueError:
+            continue
+        try:
+            d = float(a[3]) if len(a) > 3 else 0.0
+        except ValueError:
+            d = 0.0
+        yield idx, t, d, len(a) > 4 and a[4].startswith("K")
+    p.wait()
+
+
+def scan_source(src, info):
+    """One pass over the source: the time of every video frame (sorted) and where each
+    audio track starts, ends and has gaps. This is the reference for all later checks."""
+    vidx = info["vindex"]
+    audio = {a["index"]: {"first": None, "end": None, "gaps": 0} for a in info["audio"]}
+    times = []
+    for idx, t, d, _ in scan_packets(src):
+        if idx == vidx:
+            times.append(t)
+        elif idx in audio:
+            a = audio[idx]
+            if a["first"] is None:
+                a["first"], a["end"] = t, t + d
+            else:
+                if t - a["end"] > 0.1:
+                    a["gaps"] += 1
+                a["first"], a["end"] = min(a["first"], t), max(a["end"], t + d)
+    times.sort()
+    return times, audio
+
+
+STD_RATES = ["24000/1001", "24/1", "25/1", "30000/1001", "30/1", "48/1", "50/1", "60000/1001", "60/1"]
+
+
+def detect_cfr(vs, hints):
+    """(rate, grid start, glitch frames) if EVERY frame of the video sits on an even grid
+    (start + n / fps), else None. On a grid, pieces get clean timestamps from the frame
+    number, which also repairs small timestamp glitches in the source. If frames are missing
+    or the timing drifts anywhere, the original timestamps are kept instead, so the video
+    can never slide against the audio."""
+    n = len(vs)
+    if n < 10 or vs[-1] <= vs[0]:
         return None
-    rate = s.get("r_frame_rate", "0/0")
-    fps = ratio(rate)
-    frames = int(s.get("nb_read_packets") or 0)
-    if fps <= 0 or frames <= 0:
-        return None
-    # Last video timestamp: read only the end of the file
-    end = probe_end(src, vindex, duration)
-    if end is None:
-        return None
-    expected = (end - vstart) * fps + 1
-    if abs(frames - expected) <= 2 + frames * 0.00002:
-        print(f"⏱️  Constant {fps:.3f} fps ({frames} frames) - timestamps will be rebuilt cleanly")
-        return rate
-    print(f"⏱️  Variable frame rate ({frames} frames vs {expected:.0f} expected) - keeping original timestamps")
+    est = (n - 1) / (vs[-1] - vs[0])
+    cands = sorted({r for r in list(hints) + STD_RATES if ratio(r) > 0}, key=lambda r: abs(ratio(r) - est))
+    for rate in cands[:3]:
+        fps = ratio(rate)
+        if abs(fps - est) / est > 0.002:
+            continue
+        # grid start = median of (t - n/fps), so a glitch on the first frame can't shift it
+        sample = sorted(vs[i] - i / fps for i in range(0, n, max(1, n // 2000)))
+        start = sample[len(sample) // 2]
+        tol = 0.5 / fps
+        off = sum(1 for i, t in enumerate(vs) if abs(t - (start + i / fps)) > tol)
+        tail_ok = all(abs(vs[i] - (start + i / fps)) <= tol for i in range(max(0, n - 200), n))
+        if off <= max(3, n // 2000) and tail_ok:
+            return rate, start, off
     return None
 
 
-def probe_end(src, vindex, duration):
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", str(vindex),
-                        "-read_intervals", f"{max(0.0, duration - 60):.3f}%",
-                        "-show_entries", "packet=pts_time", "-of", "csv=p=0", src],
-                       capture_output=True, text=True)
-    pts = [float(x) for x in r.stdout.split() if x.strip() not in ("", "N/A")]
-    return max(pts) if pts else None
+def plan_pieces(vs, n):
+    """Cut by frame number: piece k = frames [cut k, cut k+1). Each boundary time sits halfway
+    between the last frame of one piece and the first frame of the next, so every frame lands
+    in exactly one piece - for constant AND variable frame rate sources. The plan also says
+    how many frames each piece must contain; every encoder checks its piece against that."""
+    total = len(vs)
+    cuts = [0]
+    for k in range(1, n):
+        i = max(cuts[-1] + 1, round(total * k / n))
+        while i < total - 1 and vs[i] <= vs[i - 1]:     # never cut between two frames with the same time
+            i += 1
+        cuts.append(min(i, total - 1))
+    cuts.append(total)
+    pieces = []
+    for k in range(n):
+        i0, i1 = cuts[k], cuts[k + 1]
+        pieces.append({"index": k,
+                       "start": None if k == 0 else (vs[i0 - 1] + vs[i0]) / 2,
+                       "end": None if k == n - 1 else (vs[i1 - 1] + vs[i1]) / 2,
+                       "first": i0, "frames": i1 - i0, "t0": vs[i0]})
+    return pieces
 
 
 def cut_piece(src, plan, p):
@@ -563,11 +629,26 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
     info = CE.probe(src)
     if info is None:
         die("ffprobe could not read the source file")
-    fmt_start, vstart, fps = probe_timing(src, info["vindex"])
+    fmt_start, fps, rate_hints = probe_timing(src, info["vindex"])
     duration = info["duration"]
-    cfr_rate = detect_cfr(src, info["vindex"], vstart, duration)
     if duration <= 0:
         die("could not read the video duration")
+    # The time of every video frame + where each audio track starts and ends
+    t_scan = time.time()
+    vs, audio_scan = scan_source(src, info)
+    if len(vs) < 2:
+        die("could not read the video frames of the source")
+    cfr = detect_cfr(vs, rate_hints)
+    if cfr:
+        cfr_rate, vstart, glitches = cfr
+        fps = ratio(cfr_rate)
+        print(f"⏱️  Constant {fps:.3f} fps ({len(vs)} frames, all on the grid"
+              + (f" except {glitches} glitch frames" if glitches else "")
+              + f") - timestamps will be rebuilt cleanly [scan {time.time() - t_scan:.0f}s]")
+    else:
+        cfr_rate, vstart = None, vs[0]
+        print(f"⏱️  Variable frame rate or missing frames ({len(vs)} frames) - "
+              f"keeping the original timestamps [scan {time.time() - t_scan:.0f}s]")
     print(f"📐 {os.path.basename(src)}: {info['width']}x{info['height']} @ {fps:.3f} fps, "
           f"{CE.format_time(duration)}, {len(info['audio'])} audio, {len(info['subs'])} subs")
 
@@ -606,12 +687,9 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
         print(f"ℹ️  Using {need} pieces so each stays under 2 GB")
         n = need
 
-    # Boundaries half a frame between frames -> every frame lands in exactly one piece
+    # Boundaries sit between two frames -> every frame lands in exactly one piece
     step = duration / n
-    bounds = [vstart + (round(k * step * fps) - 0.5) / fps for k in range(1, n)]
-    pieces = [{"index": k,
-               "start": bounds[k - 1] if k > 0 else None,
-               "end": bounds[k] if k < n - 1 else None} for k in range(n)]
+    pieces = plan_pieces(vs, n)
 
     base = name.strip() or os.path.splitext(os.path.basename(src))[0]
     if base.lower().endswith(CE.VIDEO_EXTENSIONS):
@@ -619,6 +697,7 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
     plan = {
         "source": os.path.basename(src), "base": base, "duration": duration,
         "fmt_start": fmt_start, "vstart": vstart, "fps": fps, "cfr_rate": cfr_rate,
+        "frames": len(vs),
         "vindex": info["vindex"], "sar": info["sar"], "crop": crop, "tags": tags,
         "pieces": pieces, "info": info,
         "has_extras": has_extras,
@@ -630,6 +709,18 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
         kept = ", ".join(f"{a.get('language') or '?'}" + (f" ({a['title']})" if a.get("title") else "")
                          for a in plan["audio"])
         print(f"🔊 Audio: keeping {len(plan['audio'])} of {len(info['audio'])} track(s): {kept}")
+    # Where each kept audio track starts/ends in the source: the join is checked against this
+    plan["audio_ref"] = [{"start": audio_scan[a["index"]]["first"] - fmt_start,
+                          "end": audio_scan[a["index"]]["end"] - fmt_start,
+                          "gaps": audio_scan[a["index"]]["gaps"]}
+                         for a in plan["audio"] if audio_scan.get(a["index"], {}).get("first") is not None]
+    if not cfr_rate:
+        # Variable frame rate: the join is checked against the source's own frame times
+        timeline_path = os.path.join(WORK, "timeline.json")
+        with open(timeline_path, "w", encoding="utf-8") as f:
+            json.dump([round(t - fmt_start, 6) for t in vs], f)
+        store_upload(timeline_path)
+        plan["timeline"] = "timeline.json"
 
     # Cover image(s): saved as files now, attached to the output when joining
     covers = CE.dump_covers(src, info, WORK) if hasattr(CE, "dump_covers") else []
@@ -729,10 +820,99 @@ def cmd_encode(index):
 
     start = time.time()
     ffmpeg(args, f"piece {k}")
-    print(f"✅ Piece {k} encoded in {CE.format_time(time.time() - start)}")
-    for out in outs:
-        print(f"   {os.path.basename(out)}: {mb(out)}")
-        store_upload(out)
+    secs = time.time() - start
+    print(f"✅ Piece {k} encoded in {CE.format_time(secs)}")
+
+    # Check every output before it leaves this runner: its frame count must match the plan
+    expected = p.get("frames")
+    report = {"index": k, "expected": expected, "seconds": round(secs),
+              "frames": {}, "bytes": {}, "header": {}, "md5": {}}
+    wrong = []
+    for t, out in zip(tags, outs):
+        got = count_frames(out)
+        report["frames"][t], report["bytes"][t], report["header"][t] = got, os.path.getsize(out), header_hash(out)
+        report["md5"][t] = file_md5(out)        # the join verifies this: nothing may change on the way
+        note = ""
+        if expected is not None and got != expected:
+            note = f"   <-- the plan says {expected}"
+            if abs(got - expected) > FRAME_TOLERANCE:
+                wrong.append(f"{t}: {got} frames, the plan says {expected}")
+            else:
+                print(f"::warning::piece {k} {t}: {got} frames, the plan says {expected} "
+                      f"(damaged spot in the source?)")
+        print(f"   {os.path.basename(out)}: {mb(out)}, {got} frames{note}")
+    if wrong:
+        die(f"piece {k} has the wrong number of frames - " + "; ".join(wrong))
+
+    # One upload per piece: every format + the check report in one bundle
+    report_path = os.path.join(d, f"piece_{k:03d}.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f)
+    bundle = os.path.join(d, f"piece_{k:03d}.tar")
+    with tarfile.open(bundle, "w") as tar:
+        for path in outs + [report_path]:
+            tar.add(path, arcname=os.path.basename(path))
+    store_upload(bundle)
+
+
+FRAME_TOLERANCE = 2        # a piece may be off by this many frames (damaged spot in the source)
+
+
+def file_md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(8 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def count_frames(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+                        "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path],
+                       capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip().strip(",").split(",")[0])
+    except ValueError:
+        return -1
+
+
+def header_hash(path):
+    """Fingerprint of a piece's encoder header (resolution, profile, level, ...).
+    For HEVC only the parameter sets (VPS/SPS/PPS) count: x265 also stores its settings text
+    there, and that text is different in every piece (each piece has its own bitrate)."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_data",
+                        "-show_entries", "stream=codec_name,extradata", "-of", "json", path],
+                       capture_output=True, text=True)
+    try:
+        s = json.loads(r.stdout)["streams"][0]
+    except (ValueError, KeyError, IndexError):
+        return ""
+    raw = bytearray()
+    for line in s.get("extradata", "").splitlines():       # hex dump: "00000000: 0164 001e ...  text"
+        if ":" not in line:
+            continue
+        try:
+            raw += bytes.fromhex(line.split(":", 1)[1].strip().split("  ")[0].replace(" ", ""))
+        except ValueError:
+            return ""
+    data = bytes(raw)
+    if s.get("codec_name") == "hevc" and len(data) > 23 and data[0] == 1:
+        keep, pos = bytearray(), 23
+        try:
+            for _ in range(data[22]):                       # arrays of NAL units
+                nal_type = data[pos] & 0x3F
+                count = int.from_bytes(data[pos + 1:pos + 3], "big")
+                pos += 3
+                for _ in range(count):
+                    size = int.from_bytes(data[pos:pos + 2], "big")
+                    pos += 2
+                    if nal_type in (32, 33, 34):            # VPS, SPS, PPS
+                        keep += data[pos:pos + size]
+                    pos += size
+            data = bytes(keep)
+        except IndexError:
+            pass
+    return hashlib.md5(data).hexdigest() if data else ""
 
 
 # -------------------------------------------------------------------------------
@@ -747,29 +927,155 @@ def media_duration(path):
         return 0.0
 
 
-def interleave_lead(path):
-    """How many seconds audio is written ahead of video, worst case, in file order.
-    A few tenths is normal; many seconds makes players drop the audio."""
-    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type",
-                        "-of", "csv=p=0", path], capture_output=True, text=True)
-    kinds = dict(line.split(",")[:2] for line in r.stdout.split() if "," in line)
-    # Only the main video (first video stream) - a cover image is also a "video" stream
-    main_video = next((k for k, v in kinds.items() if v == "video"), None)
-    kinds = {k: ("main" if k == main_video else v) for k, v in kinds.items()}
-    p = subprocess.Popen(["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time",
-                          "-of", "csv=p=0", path], stdout=subprocess.PIPE, text=True)
-    max_audio, worst = 0.0, 0.0
-    for line in p.stdout:
-        parts = line.strip().split(",")
-        if len(parts) < 2 or parts[1] in ("", "N/A"):
-            continue
-        kind, t = kinds.get(parts[0]), float(parts[1])
-        if kind == "audio":
-            max_audio = max(max_audio, t)
-        elif kind == "main":
-            worst = max(worst, max_audio - t)
-    p.wait()
-    return worst
+def stream_kinds(path):
+    """index -> 'main' (the movie's video), 'audio', 'cover', 'subtitle' ..."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                        "stream=index,codec_type:stream_disposition=attached_pic", "-of", "json", path],
+                       capture_output=True, text=True)
+    kinds, main_seen = {}, False
+    for s in json.loads(r.stdout or "{}").get("streams", []):
+        kind = s.get("codec_type")
+        if kind == "video":
+            if main_seen or s.get("disposition", {}).get("attached_pic"):
+                kind = "cover"
+            else:
+                kind, main_seen = "main", True
+        kinds[s["index"]] = kind
+    return kinds
+
+
+def check_output(path, plan, piece_frames, starts, timeline):
+    """Read every packet of a finished file once and compare it with the plan: the frame
+    count, the time of every single frame, a keyframe at every join, the audio's start / end /
+    gaps against the source, and the audio-video write order.
+    Returns (errors, warnings, facts, shift of the whole file in seconds)."""
+    kinds = stream_kinds(path)
+    video, audio = [], {}
+    max_audio, lead = None, 0.0
+    for idx, t, d, key in scan_packets(path):
+        kind = kinds.get(idx)
+        if kind == "main":
+            video.append((t, key))
+            if max_audio is not None:
+                lead = max(lead, max_audio - t)
+        elif kind == "audio":
+            a = audio.get(idx)
+            if a is None:
+                audio[idx] = [t, t + d, 0]
+            else:
+                if t - a[1] > 0.1:
+                    a[2] += 1
+                a[0], a[1] = min(a[0], t), max(a[1], t + d)
+            max_audio = t if max_audio is None else max(max_audio, t)
+    video.sort()
+    errors, warns, facts = [], [], {"frames": len(video), "lead": lead, "audio_start_ms": []}
+
+    # 1. frame count
+    total = sum(piece_frames)
+    if len(video) != total:
+        errors.append(f"the file has {len(video)} video frames but the pieces had {total}")
+    if total != plan["frames"]:
+        warns.append(f"{total} frames encoded, the source has {plan['frames']}")
+
+    # 2. every frame at its exact time
+    shift = 0.0
+    if video:
+        fps = ratio(plan["cfr_rate"]) if plan.get("cfr_rate") else 0.0
+        shift = video[0][0] - starts[0]
+        if not -0.002 <= shift <= 0.060:
+            errors.append(f"the video starts {shift * 1000:+.0f} ms away from its place")
+        expected = []
+        for k, m in enumerate(piece_frames):
+            p = plan["pieces"][k]
+            if fps:
+                expected += [starts[k] + j / fps for j in range(m)]
+            elif timeline and m == p["frames"]:
+                expected += timeline[p["first"]:p["first"] + m]
+            else:
+                expected += [None] * m
+        worst, at, compared = 0.0, 0, 0
+        for i, ((t, _), e) in enumerate(zip(video, expected)):
+            if e is None:
+                continue
+            compared += 1
+            err = abs(t - shift - e)
+            if err > worst:
+                worst, at = err, i
+        facts["timing_ms"] = worst * 1000
+        if worst > 0.0015:
+            errors.append(f"frame {at} (at {video[at][0]:.3f}s) is {worst * 1000:.1f} ms away from its place")
+        if compared < len(video):
+            warns.append(f"{len(video) - compared} frames could not be compared with the source's timing")
+        # 3. every piece must start with a keyframe
+        pos = 0
+        for k, m in enumerate(piece_frames):
+            if pos < len(video) and not video[pos][1]:
+                errors.append(f"piece {k} does not start with a keyframe (at {video[pos][0]:.3f}s)")
+            pos += m
+
+    # 4. audio against the source
+    tracks = [audio[i] for i in sorted(audio)]
+    want = len(plan.get("audio", [])) if plan["has_extras"] else 0
+    if len(tracks) != want:
+        errors.append(f"{len(tracks)} audio tracks in the file, expected {want}")
+    for i, (a, ref) in enumerate(zip(tracks, plan.get("audio_ref", []))):
+        d0 = (a[0] - shift) - ref["start"]      # normally minus the encoder's start-up (AAC ~21 ms)
+        d1 = (a[1] - shift) - ref["end"]
+        facts["audio_start_ms"].append(round(d0 * 1000))
+        if not -0.060 <= d0 <= 0.010:
+            errors.append(f"audio track {i + 1} starts {d0 * 1000:+.0f} ms away from the source's timing")
+        if abs(d1) > 0.5:
+            errors.append(f"audio track {i + 1} ends {d1:+.2f}s away from the source's audio")
+        elif abs(d1) > 0.15:
+            warns.append(f"audio track {i + 1} ends {d1 * 1000:+.0f} ms away from the source's audio")
+        if a[2] > ref.get("gaps", 0):
+            errors.append(f"audio track {i + 1} has {a[2]} gaps (the source has {ref.get('gaps', 0)})")
+    if lead > 2:
+        errors.append(f"audio is written up to {lead:.1f}s ahead of video - players may drop audio")
+    return errors, warns, facts, shift
+
+
+def decode_test(path, times):
+    """Really decode 2.5 s of video around each given time (every join). Returns the problems."""
+    def one(t):
+        # Only the decoding is tested here (frame times are checked exactly above), so the
+        # decoded frames get simple evenly spaced times: one every 0.1 s.
+        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-xerror",
+                            "-ss", f"{max(0.0, t - 1.0):.3f}", "-t", "2.5", "-i", path,
+                            "-map", "0:v:0", "-vf", "setpts=N/(10*TB)", "-fps_mode", "passthrough",
+                            "-f", "null", "-"], capture_output=True, text=True)
+        err = " ".join(r.stderr.split())
+        return (t, err or f"decoder exit code {r.returncode}") if (r.returncode != 0 or err) else None
+    with ThreadPoolExecutor(4) as pool:
+        return [x for x in pool.map(one, times) if x]
+
+
+def unpack_bundles(d):
+    for name in sorted(os.listdir(d)):
+        if name.startswith("piece_") and name.endswith(".tar"):
+            path = os.path.join(d, name)
+            with tarfile.open(path) as tar:
+                try:
+                    tar.extractall(d, filter="data")
+                except TypeError:                     # Python older than 3.12
+                    tar.extractall(d)
+            os.remove(path)
+
+
+def video_codec(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                        "stream=codec_name", "-of", "csv=p=0", path], capture_output=True, text=True)
+    return r.stdout.strip().strip(",")
+
+
+def headers_inband(piece):
+    """Rewrite one HEVC piece (stream copy) so its encoder header travels inside the stream."""
+    tmp = piece + ".hdr.mkv"
+    r = subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", piece, "-map", "0:v:0",
+                        "-c", "copy", "-bsf:v", "hevc_mp4toannexb", tmp], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"could not rewrite {os.path.basename(piece)}: {r.stderr[:300]}")
+    os.replace(tmp, piece)
 
 
 def cmd_merge():
@@ -777,29 +1083,75 @@ def cmd_merge():
     store_download(["plan.json", "piece_*"], d)
     with open(os.path.join(d, "plan.json"), encoding="utf-8") as f:
         plan = json.load(f)
+    unpack_bundles(d)
     if plan["has_extras"]:
         store_download(["extras_*"], d)
     covers = [dict(c, path=os.path.join(d, c["file"])) for c in plan.get("covers", [])]
     if covers:
         store_download([c["file"] for c in covers], d)
+    timeline = None
+    if plan.get("timeline"):
+        store_download([plan["timeline"]], d)
+        with open(os.path.join(d, plan["timeline"]), encoding="utf-8") as f:
+            timeline = json.load(f)
     # Fonts (attachments) come in through the extras file, covers are attached after them
     fonts = plan["info"].get("n_attachments", 0) if plan["has_extras"] else 0
 
     out_dir = os.path.join(WORK, "out")
     os.makedirs(out_dir, exist_ok=True)
-    n = len(plan["pieces"])
+    ps = plan["pieces"]
+    n = len(ps)
     # Audio/subs were written relative to the file start; video starts at vstart
     offset = plan["vstart"] - plan["fmt_start"]
+    # Where every piece must start in the finished file, and how long the plan says it is.
+    # The join puts each piece at exactly that time, so nothing can add up to a drift.
+    fps = ratio(plan["cfr_rate"]) if plan.get("cfr_rate") else 0.0
+    if fps:
+        starts = [offset + p["first"] / fps for p in ps]
+        planned = [p["frames"] / fps for p in ps]
+    else:
+        starts = [p["t0"] - plan["fmt_start"] for p in ps]
+        planned = [ps[k + 1]["t0"] - ps[k]["t0"] for k in range(n - 1)] + [None]
 
+    reports = []
+    for k in range(n):
+        path = os.path.join(d, f"piece_{k:03d}.json")
+        if not os.path.exists(path):
+            die(f"piece {k} is missing - no result was uploaded for it")
+        with open(path, encoding="utf-8") as f:
+            reports.append(json.load(f))
+        if reports[k].get("index") != k:
+            die(f"piece {k}: its bundle holds piece {reports[k].get('index')}")
+
+    failed, rows = [], []
     for t in plan["tags"]:
         pieces = [os.path.join(d, f"piece_{t}_{k:03d}.mkv") for k in range(n)]
         missing = [os.path.basename(p) for p in pieces if not os.path.exists(p)]
         if missing:
             die(f"missing pieces for {t}: {missing}")
+        piece_frames = [reports[k]["frames"].get(t, -1) for k in range(n)]
+        notes = []
+        # Every piece must arrive exactly as its encoder wrote it
+        for k, p in enumerate(pieces):
+            want = reports[k].get("md5", {}).get(t)
+            if want and file_md5(p) != want:
+                die(f"piece {k} ({t}) was damaged on the way (checksum mismatch) - re-run the failed job")
+
+        # The encoder header must be the same in every piece
+        if len({reports[k]["header"].get(t) for k in range(n)}) > 1:
+            if video_codec(pieces[0]) == "hevc":
+                for p in pieces:
+                    headers_inband(p)
+                notes.append("encoder headers differed between pieces - every piece now carries its own")
+            else:
+                notes.append("encoder headers differ between pieces (the join keeps each piece's own)")
+
         list_path = os.path.join(d, f"list_{t}.txt")
         with open(list_path, "w", encoding="utf-8") as f:
-            for p in pieces:
+            for p, dur in zip(pieces, planned):
                 f.write("file '" + p.replace("\\", "/").replace("'", "'\\''") + "'\n")
+                if dur is not None:
+                    f.write(f"duration {dur:.6f}\n")
 
         out = os.path.join(out_dir, plan["outputs"][t])
         extras = os.path.join(d, f"extras_{t}.mkv")
@@ -820,25 +1172,53 @@ def cmd_merge():
         args += ["-max_interleave_delta", "0", "-max_muxing_queue_size", "4096", out]
         ffmpeg(args, f"join {t}")
 
+        # ---- checks: nothing is uploaded unless all of them pass ----
+        name = os.path.basename(out)
         got = media_duration(out)
+        size_text = mb(out)
+        errors, warns, facts, shift = check_output(out, plan, piece_frames, starts, timeline)
         if abs(got - plan["duration"]) > 1.5:
-            print(f"::warning::{os.path.basename(out)} is {got:.2f}s but the source is "
-                  f"{plan['duration']:.2f}s - please check it")
-        print(f"✅ {os.path.basename(out)}: {mb(out)}, {CE.format_time(got)}")
+            warns.append(f"length is {got:.2f}s, the source is {plan['duration']:.2f}s")
+        spots = [0.5] + [s + shift for s in starts[1:]] + [max(0.0, got - 2.5)]
+        broken = decode_test(out, spots)
+        errors += [f"decode error near {tm:.1f}s: {msg[:200]}" for tm, msg in broken[:5]]
+        warns += notes
+
+        print(f"{'❌' if errors else '✅'} {name}: {size_text}, {CE.format_time(got)}")
         video_kbps = sum(os.path.getsize(p) for p in pieces) * 8 / max(plan["duration"], 1) / 1000
         mode = plan.get("size_mode")
         target = CE.FORMATS[t].get("target_kbps") if mode in ("target", "vbr", "vbr-flat") else None
         how = f"CRF {(plan.get('crf') or {}).get(t)}" if mode == "target" else (mode or "").upper()
         print(f"🎯 {t} video: {video_kbps:.0f} kbps" +
               (f" (target {target}, {how}, {(video_kbps / target - 1) * 100:+.1f}%)" if target else ""))
-        lead = interleave_lead(out)
-        if lead > 2:
-            print(f"::warning::{os.path.basename(out)}: audio is written up to {lead:.1f}s ahead of "
-                  f"video - players may drop audio")
-        else:
-            print(f"🔊 Audio/video order OK (audio at most {lead:.2f}s ahead of video)")
+        audio_text = ", ".join(f"{x:+d} ms" for x in facts["audio_start_ms"]) or "no audio"
+        print(f"🔎 Checks: {facts['frames']} frames (source {plan['frames']}) | every frame within "
+              f"{facts.get('timing_ms', 0):.1f} ms of its place | {len(spots)} spots decoded, "
+              f"{len(broken)} bad | audio start {audio_text} | audio ahead of video {facts['lead']:.2f}s")
+        for w in warns:
+            print(f"::warning::{name}: {w}")
+        for e in errors:
+            print(f"::error::{name}: {e}")
+        rows.append((name, size_text, f"{facts['frames']} / {plan['frames']}",
+                     f"{facts.get('timing_ms', 0):.1f} ms", f"{len(spots) - len(broken)} / {len(spots)}",
+                     audio_text, "FAILED" if errors else ("passed, see warnings" if warns else "passed")))
+        if errors:
+            os.replace(out, out + ".failed")        # keeps it out of every upload step
+            failed.append(t)
         for p in pieces:
             os.remove(p)
+
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write("### Checks before upload\n\n| File | Size | Frames (file / source) | Frame timing | "
+                    "Joins decoded OK | Audio start vs source | Result |\n|---|---|---|---|---|---|---|\n")
+            for row in rows:
+                f.write("| " + " | ".join(row) + " |\n")
+            f.write("\n")
+    if failed:
+        die(f"checks failed for {', '.join(failed)} - those files are not uploaded. "
+            f"The pieces are kept, so the join can be re-run.")
 
 
 # -------------------------------------------------------------------------------

@@ -44,9 +44,9 @@ on:
         type: boolean
         default: true
       output:
-        description: "Where to put the finished file"
+        description: "Where to put the finished file (none = run all checks, upload nothing)"
         type: choice
-        options: [gofile, artifact, release]
+        options: [gofile, artifact, release, none]
         default: gofile
 
 permissions:
