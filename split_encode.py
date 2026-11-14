@@ -377,11 +377,41 @@ def cut_piece(src, plan, p):
     args += ["-copyts", "-i", src, "-map", f"0:{plan['vindex']}", "-c", "copy",
              "-output_ts_offset", str(TS_OFFSET), out]
     ffmpeg(args, f"cut {p['index']}")
-    if os.path.getsize(out) > 2000 * 1024 * 1024:
+    size = os.path.getsize(out)
+    if size > 2000 * 1024 * 1024:
         die(f"piece {p['index']} is over 2 GB - use more chunks")
     print(f"✂️  piece {p['index']}: {mb(out)}", flush=True)
     store_upload(out)
     os.remove(out)
+    return size
+
+
+WEIGHT_MIN, WEIGHT_MAX = 0.6, 1.6     # a piece gets 0.6x - 1.6x of the format's bitrate
+
+
+def piece_weights(plan, sizes):
+    """VBR shares: each piece's share of the bitrate follows how many bits the SOURCE spent
+    on it per second - a hard battle scene is much bigger in the source than calm talking.
+    The time-weighted average share is exactly 1.0, so the whole movie lands on the
+    format's bitrate. "vbr-flat" (or a single piece) = every piece gets 1.0."""
+    n = len(plan["pieces"])
+    if getattr(CE, "SIZE_MODE", "") != "vbr" or n < 2:
+        return [1.0] * n
+    first, last = plan["vstart"], plan["vstart"] + plan["duration"]
+    durs, rates = [], []
+    for p, size in zip(plan["pieces"], sizes):
+        s = p["start"] if p["start"] is not None else first
+        e = p["end"] if p["end"] is not None else last
+        cut_len = (e - s) + (EDGE if p["start"] is not None else 0) + (EDGE if p["end"] is not None else 0)
+        durs.append(max(e - s, 0.001))
+        rates.append(size / max(cut_len, 0.001))
+    mean = sum(r * d for r, d in zip(rates, durs)) / sum(durs)
+    w = [r / mean for r in rates]
+    for _ in range(6):        # keep inside the limits, then re-balance to average 1.0
+        w = [min(WEIGHT_MAX, max(WEIGHT_MIN, x)) for x in w]
+        avg = sum(x * d for x, d in zip(w, durs)) / sum(durs)
+        w = [x / avg for x in w]
+    return [round(x, 3) for x in w]
 
 
 AUDIO_SOURCE = "audiosrc.mkv"
@@ -624,10 +654,16 @@ def cmd_prepare(chunks_req, formats, crop_flag, name=""):
         audio_copy = side.submit(extract_audio_source, src, plan)
         size_job = side.submit(probe_crf, src, plan)
         with ThreadPoolExecutor(3) as pool:
-            list(pool.map(lambda p: cut_piece(src, plan, p), pieces))
+            sizes = list(pool.map(lambda p: cut_piece(src, plan, p), pieces))
         audio_copy.result()
         plan["crf"] = size_job.result()
     plan["size_mode"] = getattr(CE, "SIZE_MODE", "crf")
+    if plan["size_mode"] in ("vbr", "vbr-flat"):
+        plan["piece_weight"] = piece_weights(plan, sizes)
+        w = plan["piece_weight"]
+        hard = max(range(n), key=lambda i: w[i])
+        print(f"🎚️  VBR shares per piece: {' '.join(f'{x:.2f}' for x in w)}")
+        print(f"🎚️  Hardest piece {hard}: {w[hard]:.2f}x the bitrate | whole movie averages exactly 1.00x")
     # The plan goes up last: encode jobs start only after this job, and need the CRFs
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump(plan, f, indent=2)
@@ -666,6 +702,11 @@ def cmd_encode(index):
         CE.SIZE_MODE = plan.get("size_mode", CE.SIZE_MODE)
     if hasattr(CE, "CRF_OVERRIDE"):
         CE.CRF_OVERRIDE = plan.get("crf") or {}
+    if hasattr(CE, "PIECE_BITRATE") and plan.get("size_mode") in ("vbr", "vbr-flat"):
+        w = (plan.get("piece_weight") or [1.0] * len(plan["pieces"]))[k]
+        CE.PIECE_BITRATE = {t: CE.FORMATS[t]["target_kbps"] * w for t in tags}
+        print(f"🎚️  Piece {k} VBR share {w:.2f}x: " +
+              ", ".join(f"{t} {CE.PIECE_BITRATE[t]:.0f}k" for t in tags), flush=True)
 
     def scale(t):
         return f"{scale_chain(plan, t)}[{vlabel(t)}]"
@@ -785,9 +826,11 @@ def cmd_merge():
                   f"{plan['duration']:.2f}s - please check it")
         print(f"✅ {os.path.basename(out)}: {mb(out)}, {CE.format_time(got)}")
         video_kbps = sum(os.path.getsize(p) for p in pieces) * 8 / max(plan["duration"], 1) / 1000
-        target = CE.FORMATS[t].get("target_kbps") if plan.get("size_mode") == "target" else None
-        crf = (plan.get("crf") or {}).get(t)
-        print(f"🎯 {t} video: {video_kbps:.0f} kbps" + (f" (target {target}, CRF {crf})" if target else ""))
+        mode = plan.get("size_mode")
+        target = CE.FORMATS[t].get("target_kbps") if mode in ("target", "vbr", "vbr-flat") else None
+        how = f"CRF {(plan.get('crf') or {}).get(t)}" if mode == "target" else (mode or "").upper()
+        print(f"🎯 {t} video: {video_kbps:.0f} kbps" +
+              (f" (target {target}, {how}, {(video_kbps / target - 1) * 100:+.1f}%)" if target else ""))
         lead = interleave_lead(out)
         if lead > 2:
             print(f"::warning::{os.path.basename(out)}: audio is written up to {lead:.1f}s ahead of "
