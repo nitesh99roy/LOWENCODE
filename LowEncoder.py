@@ -5,11 +5,13 @@ LowEncoder.py - CPU (libx265 / HEVC) small-size encoder. One quality, no waterma
 CPU version of MOVIES.py (HEVC QSV) with the same encode structure:
   * HEVC, profile main, GOP 240 closed (IDR), 7 B-frames, 4 reference frames
   * fixed output height (480 / 720 / 1080), width follows the aspect ratio
-  * every audio track -> Opus 48k stereo, subtitles copied (first one default)
+  * every audio track stereo, subtitles copied (first one default)
   * smart black-bar crop
 Rate control: CRF 27 (quality-based) capped at the old QSV max bitrate for
 each quality, so busy scenes can never blow up the file size.
-Quality: 10-bit (Main10), preset slower, 480p/720p tuned with ctu=32 + qg-size=16.
+Two versions (VERSIONS below), picked per run:
+  10bit = Main10, preset slower, 480p/720p tuned with ctu=32 + qg-size=16, Opus 48k
+  8bit  = the older setup: Main 8-bit, preset slow, AAC 64k
 
 Local use: put videos in Encode_Input/, run `py LowEncoder.py`, pick a quality.
 GitHub use: split_encode.py imports this file for its settings (ENCODER_MODULE=LowEncoder).
@@ -32,8 +34,21 @@ INPUT_FOLDER = "Encode_Input"
 OUTPUT_FOLDER = "Encode_Output"
 
 CRF = 27                  # higher = smaller file. 27 = small but clean for HEVC
-X265_PRESET = "slower"    # medium / slow / slower / veryslow (MOVIES.py used veryslow on QSV)
-TEN_BIT = True            # HEVC Main10: more quality per MB + no banding (needs a 10-bit capable player)
+
+# Two versions, picked per run ("version" in the GitHub workflow):
+#   10bit = HEVC Main10, preset slower, low-res tuning, Opus 48k  (better picture, ~3x slower)
+#   8bit  = the older setup: HEVC Main 8-bit, preset slow, no extra tuning, AAC 64k
+#           (faster, plays on every device)
+VERSIONS = {
+    "10bit": {"ten_bit": True, "preset": "slower", "lowres_tuning": True,
+              "audio_codec": "libopus", "audio_bitrate": "48k"},
+    "8bit": {"ten_bit": False, "preset": "slow", "lowres_tuning": False,
+             "audio_codec": "aac", "audio_bitrate": "64k"},
+}
+VERSION = "10bit"
+X265_PRESET = VERSIONS[VERSION]["preset"]       # medium / slow / slower / veryslow
+TEN_BIT = VERSIONS[VERSION]["ten_bit"]           # HEVC Main10 (needs a 10-bit capable player)
+LOWRES_TUNING = VERSIONS[VERSION]["lowres_tuning"]
 
 # x265 settings matching MOVIES.py + extras for better quality per MB
 X265_PARAMS = {
@@ -61,14 +76,29 @@ QUALITIES = {
     "720p": {"height": 720, "maxrate": "900k", "bufsize": "1800k"},
     "1080p": {"height": 1080, "maxrate": "1750k", "bufsize": "3500k"},
 }
-AUDIO_CODEC = "libopus"   # Opus: better than AAC at lower bitrate ("aac" for old TVs)
-AUDIO_BITRATE = "48k"     # per audio track (Opus 48k sounds better than AAC 64k)
+AUDIO_CODEC = VERSIONS[VERSION]["audio_codec"]       # per audio track
+AUDIO_BITRATE = VERSIONS[VERSION]["audio_bitrate"]
 AUDIO_CHANNELS = 2        # stereo
 
-# Shared-interface values used by split_encode.py
-FORMATS = {tag: {"box": (q["height"] * 16 // 9, q["height"]), "audio_codec": AUDIO_CODEC,
-                 "audio_bitrate": AUDIO_BITRATE, "audio_channels": AUDIO_CHANNELS}
-           for tag, q in QUALITIES.items()}
+
+def build_formats():
+    """Shared-interface values used by split_encode.py."""
+    return {tag: {"box": (q["height"] * 16 // 9, q["height"]), "audio_codec": AUDIO_CODEC,
+                  "audio_bitrate": AUDIO_BITRATE, "audio_channels": AUDIO_CHANNELS}
+            for tag, q in QUALITIES.items()}
+
+
+FORMATS = build_formats()
+
+
+def set_version(name):
+    """Switch every setting to one of VERSIONS ("10bit" or "8bit")."""
+    global VERSION, X265_PRESET, TEN_BIT, LOWRES_TUNING, AUDIO_CODEC, AUDIO_BITRATE, FORMATS
+    v = VERSIONS[name]
+    VERSION, X265_PRESET, TEN_BIT = name, v["preset"], v["ten_bit"]
+    LOWRES_TUNING, AUDIO_CODEC, AUDIO_BITRATE = v["lowres_tuning"], v["audio_codec"], v["audio_bitrate"]
+    FORMATS.clear()
+    FORMATS.update(build_formats())
 SKIP_UPSCALE = True
 UPSCALE_TOLERANCE = 0.9
 DEFAULT_FIRST_SUBTITLE = True
@@ -80,20 +110,22 @@ VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv',
 
 def apply_env():
     """Settings from the GitHub workflow inputs (environment variables)."""
-    global CRF, X265_PRESET, TEN_BIT
+    global CRF, X265_PRESET
+    if os.environ.get("ENCODE_VERSION") in VERSIONS:
+        set_version(os.environ["ENCODE_VERSION"])
     if os.environ.get("CRF"):
         CRF = float(os.environ["CRF"])
         if CRF == int(CRF):
             CRF = int(CRF)
-    X265_PRESET = os.environ.get("X265_PRESET") or X265_PRESET
-    if os.environ.get("TEN_BIT"):
-        TEN_BIT = os.environ["TEN_BIT"].lower() == "true"
+    # "auto" (or empty) = the version's own preset
+    if os.environ.get("X265_PRESET", "auto") not in ("", "auto"):
+        X265_PRESET = os.environ["X265_PRESET"]
 
 
 def describe():
     audio = "Opus" if AUDIO_CODEC == "libopus" else AUDIO_CODEC.upper()
-    return (f"x265 {X265_PRESET} | CRF {CRF} | {'10-bit Main10' if TEN_BIT else '8-bit Main'} | "
-            f"audio {audio} {AUDIO_BITRATE} stereo")
+    return (f"version {VERSION} | x265 {X265_PRESET} | CRF {CRF} | "
+            f"{'10-bit Main10' if TEN_BIT else '8-bit Main'} | audio {audio} {AUDIO_BITRATE} stereo")
 
 
 def video_args(tag):
@@ -102,7 +134,7 @@ def video_args(tag):
             "-profile:v", "main10" if TEN_BIT else "main",
             "-maxrate", q["maxrate"], "-bufsize", q["bufsize"]]
     params = dict(X265_PARAMS)
-    if q["height"] <= 720:
+    if LOWRES_TUNING and q["height"] <= 720:
         params.update(LOWRES_PARAMS)
     args += ["-x265-params", ":".join(f"{k}={v}" for k, v in params.items())]
     return args
@@ -447,6 +479,8 @@ def main():
         enable_crop = input("Remove black bars automatically? (y/n, default y): ").strip().lower() != "n"
         print("\n1) 480p  [default]\n2) 720p\n3) 1080p")
         tag = {"1": "480p", "2": "720p", "3": "1080p"}.get(input("Choose quality (1-3): ").strip(), "480p")
+        print("\n1) 10bit - Main10, slower, Opus 48k  [default]\n2) 8bit  - older: Main, slow, AAC 64k")
+        set_version({"2": "8bit"}.get(input("Choose version (1-2): ").strip(), "10bit"))
     except EOFError:
         enable_crop, tag = True, "480p"
     print(f"✅ {tag} | {describe()} | crop: {'on' if enable_crop else 'off'}")

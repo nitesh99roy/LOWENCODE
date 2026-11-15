@@ -26,15 +26,16 @@ on:
         description: "CRF (higher = smaller file, lower = better quality)"
         required: true
         default: "27"
-      preset:
-        description: "x265 preset (slower = smaller file at same quality)"
+      version:
+        description: "10bit = Main10, slower, Opus 48k (better picture) | 8bit = older: Main, slow, AAC 64k (faster)"
         type: choice
-        options: [medium, slow, slower, veryslow]
-        default: slower
-      ten_bit:
-        description: "10-bit HEVC (Main10): better quality per MB + no banding, needs a 10-bit capable player"
-        type: boolean
-        default: true
+        options: ["10bit", "8bit"]
+        default: "10bit"
+      preset:
+        description: "x265 preset: auto = the version's own (10bit slower, 8bit slow)"
+        type: choice
+        options: [auto, medium, slow, slower, veryslow]
+        default: auto
       chunks:
         description: "Number of pieces encoded at the same time (2-20)"
         required: true
@@ -59,7 +60,7 @@ env:
   GH_REPO: ${{ github.repository }}
   CRF: ${{ inputs.crf }}
   X265_PRESET: ${{ inputs.preset }}
-  TEN_BIT: ${{ inputs.ten_bit }}
+  ENCODE_VERSION: ${{ inputs.version }}
   AUDIO_LANGS: ${{ inputs.audio }}
   PYTHONUNBUFFERED: "1"
   FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
